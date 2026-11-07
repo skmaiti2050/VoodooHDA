@@ -743,24 +743,36 @@ bool VoodooHDADevice::initHardware(IOService *provider)
 	mIntelDisplayCodec = intelDisplayCodecWanted();
 	IOLog("VoodooHDA IntelDisplayCodec: %s\n", mIntelDisplayCodec ? "enabled" : "disabled");
 	if (mIntelDisplayCodec) {
-		intelDisplayCodecWake(true);
-		cgctl = mPciNub->configRead32(0x48);
-		mPciNub->configWrite32(0x48, cgctl & ~0x40U);
-	}
-
-	if (!resetController(true)) {
+		/* The display codec lives in the GPU's display engine: its registers and the codec itself are
+		 * unpowered until power wells 2/3 are on (Linux: i915 POWER_DOMAIN_AUDIO_*). Request them
+		 * ourselves like i915 does, then wake + reset; retry a few times if the codec does not show up. */
+		for (int attempt = 0; attempt < 4; attempt++) {
+			intelDisplayPowerWellsOn();
+			intelDisplayCodecWake(true);
+			cgctl = mPciNub->configRead32(0x48);
+			mPciNub->configWrite32(0x48, cgctl & ~0x40U);
+			if (!resetController(true)) {
+				errorMsg("error: resetController failed\n");
+				goto done;
+			}
+			mPciNub->configWrite32(0x48, cgctl | 0x40U);
+			intelDisplayCodecWake(false);
+			intelDisplayLinksPowerUp();
+			IOLog("VoodooHDA IntelDisplayCodec: attempt %d STATESTS=0x%04x\n", attempt, readData16(HDAC_STATESTS));
+			if (readData16(HDAC_STATESTS) & 0x4)
+				break;
+			IOSleep(250);
+		}
+	} else if (!resetController(true)) {
 		errorMsg("error: resetController failed\n");
 		goto done;
 	}
 
 	if (mIntelDisplayCodec) {
-		mPciNub->configWrite32(0x48, cgctl | 0x40U);
-		intelDisplayCodecWake(false);
-		intelDisplayLinksPowerUp();
 		IOLog("VoodooHDA IntelDisplayCodec: STATESTS=0x%04x GCTL=0x%08x after reset\n", readData16(HDAC_STATESTS), readData32(HDAC_GCTL));
 		IOLog("VoodooHDA IntelDisplayCodec: PCI cfg 0x40=0x%08x 0x44=0x%08x 0x48=0x%08x 0x4c=0x%08x | VC 0x110=0x%08x 0x114=0x%08x 0x11c=0x%08x 0x120=0x%08x 0x124=0x%08x\n",
 			  mPciNub->configRead32(0x40), mPciNub->configRead32(0x44), mPciNub->configRead32(0x48), mPciNub->configRead32(0x4c),
-			  mPciNub->configRead32(0x110), mPciNub->configRead32(0x114), mPciNub->configRead32(0x11c), mPciNub->configRead32(0x120), mPciNub->configRead32(0x124));
+			  mPciNub->extendedConfigRead32(0x110), mPciNub->extendedConfigRead32(0x114), mPciNub->extendedConfigRead32(0x11c), mPciNub->extendedConfigRead32(0x120), mPciNub->extendedConfigRead32(0x124));
 		if (mIgpuBase)
 			IOLog("VoodooHDA IntelDisplayCodec: GPU PWR_WELL_CTL1=0x%08x CTL2=0x%08x CTL_AUX2=0x%08x CTL_DDI2=0x%08x CDCLK_CTL=0x%08x\n",
 				  *(volatile UInt32 *)(mIgpuBase + 0x45400), *(volatile UInt32 *)(mIgpuBase + 0x45404),
@@ -768,10 +780,10 @@ bool VoodooHDADevice::initHardware(IOService *provider)
 				  *(volatile UInt32 *)(mIgpuBase + 0x46000));
 		/* Optional: Apple's AppleGFXHDA host-interface setup for Intel (VC1 enable + TC7 map in VCiCTL 0x120, TCSEL=7) */
 		if (OSDynamicCast(OSBoolean, getProperty("IntelDisplayCodecAppleVC")) == kOSBooleanTrue) {
-			UInt32 vc = mPciNub->configRead32(0x120);
-			mPciNub->configWrite32(0x120, vc | 0x80000080U);
+			UInt32 vc = mPciNub->extendedConfigRead32(0x120);
+			mPciNub->extendedConfigWrite32(0x120, vc | 0x80000080U);
 			mPciNub->configWrite32(0x44, 0x7);
-			IOLog("VoodooHDA IntelDisplayCodec: AppleVC applied: 0x120 0x%08x -> 0x%08x, TCSEL -> 7\n", vc, mPciNub->configRead32(0x120));
+			IOLog("VoodooHDA IntelDisplayCodec: AppleVC applied: 0x120 0x%08x -> 0x%08x, TCSEL -> 7\n", vc, mPciNub->extendedConfigRead32(0x120));
 		}
 	}
 
@@ -4560,4 +4572,29 @@ void VoodooHDADevice::intelDisplayLinksPowerUp()
 		IOLog("VoodooHDA IntelDisplayCodec: link %u LCAP=0x%08x LCTL 0x%08x -> 0x%08x%s\n", (unsigned) i, lcap, before, after,
 			   (after & HDAC_ML_LCTL_CPA) ? "" : " (CPA timeout)");
 	}
+}
+
+/* Request display power wells 1-3 (TGL: PWR_WELL_CTL2 0x45404, request bit 2n+1 / state bit 2n for PW(n+1)).
+ * The audio MMIO block and the display codec need PW2/PW3; i915 holds them via POWER_DOMAIN_AUDIO_*.
+ * Apple's framebuffer may power them down again when no pipe needs them. */
+bool VoodooHDADevice::intelDisplayPowerWellsOn()
+{
+	if (!mIgpuBase) {
+		intelDisplayCodecWake(false);	/* maps BAR0 as a side effect (no register writes when disabling and bit already clear) */
+		if (!mIgpuBase)
+			return false;
+	}
+	volatile UInt32 *ctl2 = (volatile UInt32 *)(mIgpuBase + 0x45404);
+	const UInt32 req = (1U << 1) | (1U << 3) | (1U << 5);
+	const UInt32 state = (1U << 0) | (1U << 2) | (1U << 4);
+	UInt32 before = *ctl2;
+	if ((before & req) != req) {
+		*ctl2 = before | req;
+		for (int i = 0; i < 100 && ((*ctl2) & state) != state; i++)
+			IODelay(100);
+	}
+	UInt32 after = *ctl2;
+	IOLog("VoodooHDA IntelDisplayCodec: PWR_WELL_CTL2 0x%08x -> 0x%08x (PW2 %s, PW3 %s)\n", before, after,
+		   (after & (1U << 2)) ? "on" : "OFF", (after & (1U << 4)) ? "on" : "OFF");
+	return (after & state) == state;
 }

@@ -192,6 +192,7 @@ public:
 	IOPCIDevice *findIntelIGPU();
 	void intelDisplayCodecWake(bool enable);
 	void intelDisplayLinksPowerUp();
+	bool intelDisplayPowerWellsOn();
 	IOMemoryMap *mIgpuMap;
 	IOVirtualAddress mIgpuBase;
 	bool mIntelDisplayCodec;
