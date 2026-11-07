@@ -120,6 +120,30 @@ void VoodooHDADevice::probeCodec(Codec *codec)
 
 	if (cad != 0)
 		IOLog("VoodooHDA IntelDisplayCodec: codec #%d vendorId=0x%08x revisionId=0x%08x\n", cad, vendorId, revisionId);
+	/* The Intel display codec is often not ready to answer verbs right after the link reset
+	 * (present in STATESTS, commands consumed, no RIRB response). Retry with short waits and
+	 * an occasional codec-wake pulse before giving up on it. */
+	if (mIntelDisplayCodec && cad != 0 && vendorId == HDAC_INVALID && revisionId == HDAC_INVALID) {
+		for (int attempt = 1; attempt <= 24; attempt++) {
+			IOSleep(25);
+			if ((attempt % 6) == 0) {
+				intelDisplayPowerWellsOn();
+				intelDisplayCodecWake(true);
+				IOSleep(2);
+				intelDisplayCodecWake(false);
+			}
+			vendorId = sendCommand(HDA_CMD_GET_PARAMETER(cad, 0, HDA_PARAM_VENDOR_ID), cad);
+			revisionId = sendCommand(HDA_CMD_GET_PARAMETER(cad, 0, HDA_PARAM_REVISION_ID), cad);
+			IOLog("VoodooHDA IntelDisplayCodec: codec #%d retry %d vendorId=0x%08x revisionId=0x%08x STATESTS=0x%04x\n",
+				  cad, attempt, vendorId, revisionId, readData16(HDAC_STATESTS));
+			if (vendorId != HDAC_INVALID || revisionId != HDAC_INVALID)
+				break;
+		}
+		codec->vendorId = HDA_PARAM_VENDOR_ID_VENDOR_ID(vendorId);
+		codec->deviceId = HDA_PARAM_VENDOR_ID_DEVICE_ID(vendorId);
+		codec->revisionId = HDA_PARAM_REVISION_ID_REVISION_ID(revisionId);
+		codec->steppingId = HDA_PARAM_REVISION_ID_STEPPING_ID(revisionId);
+	}
 	if ((vendorId == HDAC_INVALID) && (revisionId == HDAC_INVALID)) {
 		errorMsg("error: codec #%d is not responding, probing aborted\n", cad);
 		return;
