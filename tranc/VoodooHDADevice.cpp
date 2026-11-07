@@ -4677,6 +4677,14 @@ void VoodooHDADevice::intelDisplayAudioEnable()
 			continue;
 		bool isDP = (mode == 2 || mode == 3);
 
+		/* 0. Gen12 "hblank early" workaround (i915 enable_audio_dsc_wa, always applied on TGL):
+		 * AUD_CONFIG_BE (0x65ef0) HBLANK_EARLY_ENABLE_TGL(pipe) = bit 24+pipe. Without it the audio
+		 * DIP packets cause pipe underruns, which Apple's framebuffer treats as fatal (both displays
+		 * went black on 2026-11-07 without this). Transcoder == pipe index here. */
+		UInt32 be = IGPU_RD(0x65ef0);
+		IGPU_WR(0x65ef0, be | (1U << (24 + t)));
+		IOLog("VoodooHDA IntelDisplayCodec: AUD_CONFIG_BE 0x%08x -> 0x%08x\n", be, IGPU_RD(0x65ef0));
+
 		/* 1. audio output enable, ELD invalid */
 		UInt32 vld = IGPU_RD(0x650c0);
 		vld |= 1U << (t * 4 + 2);
