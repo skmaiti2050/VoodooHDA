@@ -831,6 +831,8 @@ bool VoodooHDADevice::initHardware(IOService *provider)
 	enableMsgBuffer(true);
 //	logMsg("Scanning HDA codecs...\n");
 	scanCodecs();
+	if (mIntelDisplayCodec)
+		intelDisplayAudioEnable();
 	/* Intel display codec: the timer polls for a display coming up (intelHdmiPollPresence) */
 	for (int i = 0; i < HDAC_CODEC_MAX; i++)
 		if (mCodecs[i] && mCodecs[i]->intelVendorNid && mTimerSource)
@@ -3363,6 +3365,8 @@ void VoodooHDADevice::channelStart(Channel *channel, const bool shouldLock)
     nid_t pin = getHDMIPinForChannel(channel);
     IOLog("VoodooHDA DBG: channelStart HDMI pin=%d streamId=%d speed=%d\n",
           pin, channel->streamId, (int)channel->speed);
+    if (mIntelDisplayCodec)
+      intelDisplayAudioEnable();
   }
   
   streamStop(channel);
@@ -4597,4 +4601,119 @@ bool VoodooHDADevice::intelDisplayPowerWellsOn()
 	IOLog("VoodooHDA IntelDisplayCodec: PWR_WELL_CTL2 0x%08x -> 0x%08x (PW2 %s, PW3 %s)\n", before, after,
 		   (after & (1U << 2)) ? "on" : "OFF", (after & (1U << 4)) ? "on" : "OFF");
 	return (after & state) == state;
+}
+
+/* ---- GPU side of Intel display audio (what i915's hsw_audio_codec_enable does) ----
+ * For every enabled transcoder that drives a non-eDP DDI: enable audio output on the transcoder,
+ * write a minimal ELD (2-channel LPCM) into the transcoder's ELD buffer, mark it valid, and program
+ * AUD_CONFIG (HDMI: pixel-clock code + N for 48 kHz; DP: N-value-index). Apple's framebuffer never
+ * does this here (its audio flag stays off), so without it the codec pin has no sink. Registers (TGL):
+ * TRANS_CONF 0x70008+0x1000*t, TRANS_DDI_FUNC_CTL 0x60400+0x1000*t, AUD_CONFIG 0x65000+0x100*t,
+ * AUD_EDID_DATA 0x65050+0x100*t, AUD_DIP_ELD_CTL 0x650b4+0x100*t, AUD_PIN_ELD_CP_VLD 0x650c0. */
+static const struct { UInt32 khz; UInt32 code; } gHdmiPixelClockCodes[] = {
+	{25174,0},{25200,1},{27000,2},{27027,3},{54000,4},{54054,5},{74176,6},{74250,7},
+	{148352,8},{148500,9},{296703,10},{297000,11},{593407,12},{594000,13}};
+static const struct { UInt32 khz; UInt32 n48; } gHdmiN48k[] = {
+	{25175,6864},{27000,6144},{74176,11648},{74250,6144},{148352,5824},{148500,6144},
+	{296703,5824},{297000,5120},{593407,5824},{594000,5120}};
+
+void VoodooHDADevice::intelDisplayAudioEnable()
+{
+	if (!mIntelDisplayCodec || !mIgpuBase)
+		return;
+	bool haveDisplayCodec = false;
+	for (int i = 0; i < HDAC_CODEC_MAX; i++)
+		if (mCodecs[i] && mCodecs[i]->vendorId == INTEL_VENDORID)
+			haveDisplayCodec = true;
+	if (!haveDisplayCodec)
+		return;
+	intelDisplayPowerWellsOn();
+	#define IGPU_RD(o) (*(volatile UInt32 *)(mIgpuBase + (o)))
+	#define IGPU_WR(o, v) (*(volatile UInt32 *)(mIgpuBase + (o)) = (v))
+
+	/* pixel clock of the external display from the framebuffer's properties */
+	UInt64 pixclkHz = 0;
+	OSDictionary *match = IOService::serviceMatching("AppleIntelFramebuffer");
+	if (match) {
+		OSIterator *it = IOService::getMatchingServices(match);
+		match->release();
+		if (it) {
+			OSObject *obj;
+			while ((obj = it->getNextObject())) {
+				IOService *fb = OSDynamicCast(IOService, obj);
+				if (!fb) continue;
+				OSNumber *port = OSDynamicCast(OSNumber, fb->getProperty("port-number"));
+				OSNumber *clk = OSDynamicCast(OSNumber, fb->getProperty("IOFBCurrentPixelClock"));
+				if (port && clk && port->unsigned32BitValue() != 0 && clk->unsigned64BitValue() != 0)
+					pixclkHz = clk->unsigned64BitValue();
+			}
+			it->release();
+		}
+	}
+	UInt32 pixkhz = (UInt32)(pixclkHz / 1000);
+
+	for (UInt32 t = 0; t < 4; t++) {
+		UInt32 conf = IGPU_RD(0x70008 + 0x1000 * t);
+		UInt32 func = IGPU_RD(0x60400 + 0x1000 * t);
+		UInt32 mode = (func >> 24) & 7;	/* 0 HDMI, 1 DVI, 2 DP SST, 3 DP MST */
+		UInt32 ddi = (func >> 27) & 0xf;	/* TGL: 1 = DDI A (eDP), 2 = DDI B, 3 = DDI C, 4.. = TC ports */
+		IOLog("VoodooHDA IntelDisplayCodec: transcoder %c CONF=0x%08x DDI_FUNC_CTL=0x%08x (ddi=%u mode=%u)\n", 'A' + t, conf, func, ddi, mode);
+		if (!(conf & 0x80000000U) || !(func & 0x80000000U) || ddi <= 1)
+			continue;
+		bool isDP = (mode == 2 || mode == 3);
+
+		/* 1. audio output enable, ELD invalid */
+		UInt32 vld = IGPU_RD(0x650c0);
+		vld |= 1U << (t * 4 + 2);
+		vld &= ~(1U << (t * 4));
+		IGPU_WR(0x650c0, vld);
+
+		/* 2. ELD (v2, baseline: CEA-861-D, 2ch LPCM 32/44.1/48 kHz 16/20/24 bit, FL/FR) */
+		static const char name[] = "Display";
+		UInt8 eld[32];
+		bzero(eld, sizeof eld);
+		eld[0] = 2 << 3;			/* ELD_Ver 2 */
+		eld[2] = 7;				/* baseline length in dwords (16 + 7 name + 3 SAD = 26 -> 28 bytes) */
+		eld[4] = (3 << 5) | 7;			/* CEA_EDID_Ver 3, MNL 7 */
+		eld[5] = (1 << 4) | ((isDP ? 1 : 0) << 2);	/* SAD_Count 1, Conn_Type */
+		eld[7] = 0x01;				/* speaker allocation: FL/FR */
+		memcpy(&eld[20], name, 7);
+		eld[27] = 0x09; eld[28] = 0x07; eld[29] = 0x07;	/* SAD: LPCM, 2ch, 32/44.1/48 kHz, 16/20/24 bit */
+		UInt32 ctl = IGPU_RD(0x650b4 + 0x100 * t);
+		ctl &= ~(0x1fU << 5);			/* ELD write address = 0 */
+		IGPU_WR(0x650b4 + 0x100 * t, ctl);
+		for (int i = 0; i < 8; i++) {
+			UInt32 dw = eld[i * 4] | (eld[i * 4 + 1] << 8) | (eld[i * 4 + 2] << 16) | ((UInt32) eld[i * 4 + 3] << 24);
+			IGPU_WR(0x65050 + 0x100 * t, dw);
+		}
+
+		/* 3. ELD valid */
+		vld = IGPU_RD(0x650c0);
+		vld |= 1U << (t * 4);
+		IGPU_WR(0x650c0, vld);
+
+		/* 4. AUD_CONFIG */
+		UInt32 cfg = IGPU_RD(0x65000 + 0x100 * t);
+		cfg &= ~(1U << 29);			/* N_VALUE_INDEX (DP) */
+		cfg &= ~(0xfU << 16);			/* HDMI pixel clock code */
+		cfg &= ~(1U << 28);			/* N_PROG_ENABLE */
+		cfg &= ~((0xffU << 20) | (0xfffU << 4));	/* N upper/lower */
+		if (isDP) {
+			cfg |= 1U << 29;
+		} else {
+			UInt32 code = 1, n = 0;
+			for (size_t i = 0; i < sizeof(gHdmiPixelClockCodes) / sizeof(gHdmiPixelClockCodes[0]); i++)
+				if (gHdmiPixelClockCodes[i].khz == pixkhz) code = gHdmiPixelClockCodes[i].code;
+			for (size_t i = 0; i < sizeof(gHdmiN48k) / sizeof(gHdmiN48k[0]); i++)
+				if (gHdmiN48k[i].khz == pixkhz) n = gHdmiN48k[i].n48;
+			cfg |= code << 16;
+			if (n)
+				cfg |= ((n >> 12) << 20) | ((n & 0xfff) << 4) | (1U << 28);
+		}
+		IGPU_WR(0x65000 + 0x100 * t, cfg);
+		IOLog("VoodooHDA IntelDisplayCodec: audio enabled on transcoder %c (%s, pixclk %u kHz): ELD_CP_VLD=0x%08x AUD_CONFIG=0x%08x\n",
+			  'A' + t, isDP ? "DP" : "HDMI", pixkhz, IGPU_RD(0x650c0), IGPU_RD(0x65000 + 0x100 * t));
+	}
+	#undef IGPU_RD
+	#undef IGPU_WR
 }
