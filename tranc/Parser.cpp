@@ -118,6 +118,8 @@ void VoodooHDADevice::probeCodec(Codec *codec)
 	codec->revisionId = HDA_PARAM_REVISION_ID_REVISION_ID(revisionId);
 	codec->steppingId = HDA_PARAM_REVISION_ID_STEPPING_ID(revisionId);
 
+	if (cad != 0)
+		IOLog("VoodooHDA IntelDisplayCodec: codec #%d vendorId=0x%08x revisionId=0x%08x\n", cad, vendorId, revisionId);
 	if ((vendorId == HDAC_INVALID) && (revisionId == HDAC_INVALID)) {
 		errorMsg("error: codec #%d is not responding, probing aborted\n", cad);
 		return;

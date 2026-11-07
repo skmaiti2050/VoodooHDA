@@ -758,6 +758,21 @@ bool VoodooHDADevice::initHardware(IOService *provider)
 		intelDisplayCodecWake(false);
 		intelDisplayLinksPowerUp();
 		IOLog("VoodooHDA IntelDisplayCodec: STATESTS=0x%04x GCTL=0x%08x after reset\n", readData16(HDAC_STATESTS), readData32(HDAC_GCTL));
+		IOLog("VoodooHDA IntelDisplayCodec: PCI cfg 0x40=0x%08x 0x44=0x%08x 0x48=0x%08x 0x4c=0x%08x | VC 0x110=0x%08x 0x114=0x%08x 0x11c=0x%08x 0x120=0x%08x 0x124=0x%08x\n",
+			  mPciNub->configRead32(0x40), mPciNub->configRead32(0x44), mPciNub->configRead32(0x48), mPciNub->configRead32(0x4c),
+			  mPciNub->configRead32(0x110), mPciNub->configRead32(0x114), mPciNub->configRead32(0x11c), mPciNub->configRead32(0x120), mPciNub->configRead32(0x124));
+		if (mIgpuBase)
+			IOLog("VoodooHDA IntelDisplayCodec: GPU PWR_WELL_CTL1=0x%08x CTL2=0x%08x CTL_AUX2=0x%08x CTL_DDI2=0x%08x CDCLK_CTL=0x%08x\n",
+				  *(volatile UInt32 *)(mIgpuBase + 0x45400), *(volatile UInt32 *)(mIgpuBase + 0x45404),
+				  *(volatile UInt32 *)(mIgpuBase + 0x45444), *(volatile UInt32 *)(mIgpuBase + 0x45454),
+				  *(volatile UInt32 *)(mIgpuBase + 0x46000));
+		/* Optional: Apple's AppleGFXHDA host-interface setup for Intel (VC1 enable + TC7 map in VCiCTL 0x120, TCSEL=7) */
+		if (OSDynamicCast(OSBoolean, getProperty("IntelDisplayCodecAppleVC")) == kOSBooleanTrue) {
+			UInt32 vc = mPciNub->configRead32(0x120);
+			mPciNub->configWrite32(0x120, vc | 0x80000080U);
+			mPciNub->configWrite32(0x44, 0x7);
+			IOLog("VoodooHDA IntelDisplayCodec: AppleVC applied: 0x120 0x%08x -> 0x%08x, TCSEL -> 7\n", vc, mPciNub->configRead32(0x120));
+		}
 	}
 
 	if (!getCapabilities()) {
@@ -2127,9 +2142,14 @@ void VoodooHDADevice::sendCommands(CommandList *commands, nid_t cad)
 	} while (((codec->numVerbsSent != commands->numCommands) ||
 			(codec->numRespReceived != commands->numCommands)) && --retry);
 
-	if (retry == 0)
+	if (retry == 0) {
 		errorMsg("TIMEOUT cad=%d, numcmd=%d, sent=%d, received=%d, first verb=0x%x\n", cad, commands->numCommands,
 				codec->numVerbsSent, codec->numRespReceived, commands->verbs[0]);
+		if (mIntelDisplayCodec)
+			IOLog("VoodooHDA IntelDisplayCodec: TIMEOUT cad=%d sent=%d received=%d verb=0x%08x CORBWP=%u CORBRP=%u RIRBWP=%u RIRBSTS=0x%02x\n",
+				  cad, codec->numVerbsSent, codec->numRespReceived, commands->verbs[0],
+				  readData16(HDAC_CORBWP), readData16(HDAC_CORBRP), readData16(HDAC_RIRBWP), readData8(HDAC_RIRBSTS));
+	}
 
 	codec->commands = NULL;
 	codec->numRespReceived = 0;
