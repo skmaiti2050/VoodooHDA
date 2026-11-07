@@ -4476,7 +4476,17 @@ bool VoodooHDADevice::intelDisplayCodecWanted()
 	if ((mDeviceId & 0xffffU) != INTEL_VENDORID)
 		return false;
 	OSBoolean *b = OSDynamicCast(OSBoolean, getProperty(kVoodooHDAIntelDisplayCodec));
-	return b && b->isTrue();
+	if (!b || !b->isTrue())
+		return false;
+	/* Experimental: additionally require the boot-arg -vhdadisp so an EFI without it (e.g. the
+	 * internal disk) always boots with plain audio even though this kext sits in /Library/Extensions. */
+	char dummy[16];
+	if (!PE_parse_boot_argn("-vhdadisp", dummy, sizeof dummy)) {
+		IOLog("VoodooHDA IntelDisplayCodec: plist key set but boot-arg -vhdadisp absent - disabled\n");
+		return false;
+	}
+	/* -vhdadisp-nogpu: enumerate the codec but never touch the GPU audio registers */
+	return true;
 }
 
 IOPCIDevice *VoodooHDADevice::findIntelIGPU()
@@ -4621,6 +4631,11 @@ void VoodooHDADevice::intelDisplayAudioEnable()
 {
 	if (!mIntelDisplayCodec || !mIgpuBase)
 		return;
+	char dummy[16];
+	if (PE_parse_boot_argn("-vhdadisp-nogpu", dummy, sizeof dummy)) {
+		IOLog("VoodooHDA IntelDisplayCodec: -vhdadisp-nogpu: GPU audio registers left alone\n");
+		return;
+	}
 	bool haveDisplayCodec = false;
 	for (int i = 0; i < HDAC_CODEC_MAX; i++)
 		if (mCodecs[i] && mCodecs[i]->vendorId == INTEL_VENDORID)
