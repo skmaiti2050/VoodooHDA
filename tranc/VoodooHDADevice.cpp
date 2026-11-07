@@ -741,6 +741,7 @@ bool VoodooHDADevice::initHardware(IOService *provider)
 	 * codec_wakeup(off) -> intel_init_lctl(). Enabled with the Info.plist boolean "IntelDisplayCodec".
 	 */
 	mIntelDisplayCodec = intelDisplayCodecWanted();
+	IOLog("VoodooHDA IntelDisplayCodec: %s\n", mIntelDisplayCodec ? "enabled" : "disabled");
 	if (mIntelDisplayCodec) {
 		intelDisplayCodecWake(true);
 		cgctl = mPciNub->configRead32(0x48);
@@ -756,7 +757,7 @@ bool VoodooHDADevice::initHardware(IOService *provider)
 		mPciNub->configWrite32(0x48, cgctl | 0x40U);
 		intelDisplayCodecWake(false);
 		intelDisplayLinksPowerUp();
-		logMsg("IntelDisplayCodec: STATESTS=0x%04x after reset\n", readData16(HDAC_STATESTS));
+		IOLog("VoodooHDA IntelDisplayCodec: STATESTS=0x%04x GCTL=0x%08x after reset\n", readData16(HDAC_STATESTS), readData32(HDAC_GCTL));
 	}
 
 	if (!getCapabilities()) {
@@ -4474,13 +4475,13 @@ void VoodooHDADevice::intelDisplayCodecWake(bool enable)
 	if (!mIgpuMap) {
 		IOPCIDevice *igpu = findIntelIGPU();
 		if (!igpu) {
-			errorMsg("IntelDisplayCodec: Intel IGPU (0:2:0) not found\n");
+			IOLog("VoodooHDA IntelDisplayCodec: Intel IGPU (0:2:0) not found\n");
 			return;
 		}
 		mIgpuMap = igpu->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0);
 		igpu->release();
 		if (!mIgpuMap) {
-			errorMsg("IntelDisplayCodec: cannot map IGPU BAR0\n");
+			IOLog("VoodooHDA IntelDisplayCodec: cannot map IGPU BAR0\n");
 			return;
 		}
 		mIgpuBase = mIgpuMap->getVirtualAddress();
@@ -4497,7 +4498,7 @@ void VoodooHDADevice::intelDisplayCodecWake(bool enable)
 		*chicken = *chicken | IGFX_AUD_CODEC_WAKE_SIGNAL;
 		IODelay(1500);
 	}
-	logMsg("IntelDisplayCodec: codec wake %s (AUD_CHICKENBIT=0x%08x AUD_PIN_BUF_CTL=0x%08x)\n",
+	IOLog("VoodooHDA IntelDisplayCodec: codec wake %s (AUD_CHICKENBIT=0x%08x AUD_PIN_BUF_CTL=0x%08x)\n",
 		   enable ? "on" : "off", *chicken, *pinbuf);
 }
 
@@ -4509,13 +4510,13 @@ void VoodooHDADevice::intelDisplayLinksPowerUp()
 		UInt32 cap = readData32(off);
 		if (cap == 0xffffffffU)
 			break;
-		logMsg("IntelDisplayCodec: HDA capability id %u at 0x%x\n", (unsigned) HDAC_CAP_ID(cap), (unsigned) off);
+		IOLog("VoodooHDA IntelDisplayCodec: HDA capability id %u at 0x%x\n", (unsigned) HDAC_CAP_ID(cap), (unsigned) off);
 		if (HDAC_CAP_ID(cap) == HDAC_ML_CAP_ID)
 			mlcap = off;
 		off = HDAC_CAP_NEXT(cap);
 	}
 	if (!mlcap) {
-		logMsg("IntelDisplayCodec: no multi-link capability\n");
+		IOLog("VoodooHDA IntelDisplayCodec: no multi-link capability\n");
 		return;
 	}
 	UInt32 count = readData32(mlcap + HDAC_ML_MLCD) + 1;
@@ -4531,7 +4532,7 @@ void VoodooHDADevice::intelDisplayLinksPowerUp()
 		while (timeout-- > 0 && !(readData32(base + HDAC_ML_LCTL) & HDAC_ML_LCTL_CPA))
 			IODelay(3);
 		UInt32 after = readData32(base + HDAC_ML_LCTL);
-		logMsg("IntelDisplayCodec: link %u LCAP=0x%08x LCTL 0x%08x -> 0x%08x%s\n", (unsigned) i, lcap, before, after,
+		IOLog("VoodooHDA IntelDisplayCodec: link %u LCAP=0x%08x LCTL 0x%08x -> 0x%08x%s\n", (unsigned) i, lcap, before, after,
 			   (after & HDAC_ML_LCTL_CPA) ? "" : " (CPA timeout)");
 	}
 }
