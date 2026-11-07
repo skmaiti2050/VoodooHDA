@@ -187,6 +187,14 @@ public:
 
 	bool resetController(bool wakeup);
 	bool getCapabilities();
+	/* Intel display codec (HDMI/DP audio on Skylake+ PCH controllers) — see VoodooHDADevice.cpp */
+	bool intelDisplayCodecWanted();
+	IOPCIDevice *findIntelIGPU();
+	void intelDisplayCodecWake(bool enable);
+	void intelDisplayLinksPowerUp();
+	IOMemoryMap *mIgpuMap;
+	IOVirtualAddress mIgpuBase;
+	bool mIntelDisplayCodec;
 
 	UInt8 readData8(UInt32 offset);
 	UInt16 readData16(UInt32 offset);

@@ -46,6 +46,8 @@
 			<string>VoodooHDAUserClient</string>
 			<key>InhibitCache</key>
 			<false/>
+			<key>IntelDisplayCodec</key>
+			<false/>
 			<key>LayoutId</key>
 			<integer>0</integer>
 			<key>MixerValues</key>

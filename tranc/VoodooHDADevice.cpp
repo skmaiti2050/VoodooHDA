@@ -634,6 +634,7 @@ void VoodooHDADevice::disablePCIeNoSnoop(UInt16 vendorId)
 
 bool VoodooHDADevice::initHardware(IOService *provider)
 {
+	UInt32 cgctl = 0;
 	bool result = false;
 	UInt16 config, vendorId;
 	UInt32 gCtl;
@@ -732,9 +733,30 @@ bool VoodooHDADevice::initHardware(IOService *provider)
 	 * AMD Radeon GPUs report invalid CORB/RIRB size (0) unless
 	 * the controller is reset first (FreeBSD commit dab9ef544868).
 	 */
+	/*
+	 * Intel display codec (Skylake+): the HDMI/DP codec sits on a separate HDA multi-link and
+	 * only answers the link reset while the GPU asserts the codec-wake override; afterwards the
+	 * link must be powered (LCTL.SPA) before the codec can be probed. Mirrors Linux
+	 * hda_intel_init_chip(): codec_wakeup(on) -> CGCTL clock gating off -> reset -> CGCTL on ->
+	 * codec_wakeup(off) -> intel_init_lctl(). Enabled with the Info.plist boolean "IntelDisplayCodec".
+	 */
+	mIntelDisplayCodec = intelDisplayCodecWanted();
+	if (mIntelDisplayCodec) {
+		intelDisplayCodecWake(true);
+		cgctl = mPciNub->configRead32(0x48);
+		mPciNub->configWrite32(0x48, cgctl & ~0x40U);
+	}
+
 	if (!resetController(true)) {
 		errorMsg("error: resetController failed\n");
 		goto done;
+	}
+
+	if (mIntelDisplayCodec) {
+		mPciNub->configWrite32(0x48, cgctl | 0x40U);
+		intelDisplayCodecWake(false);
+		intelDisplayLinksPowerUp();
+		logMsg("IntelDisplayCodec: STATESTS=0x%04x after reset\n", readData16(HDAC_STATESTS));
 	}
 
 	if (!getCapabilities()) {
@@ -939,6 +961,8 @@ void VoodooHDADevice::free()
 	if (mRegBase)
 		mRegBase = 0;
 	RELEASE(mBarMap);
+	RELEASE(mIgpuMap);
+	mIgpuBase = 0;
 
 	mPciNub = NULL;
 
@@ -4377,4 +4401,137 @@ void VoodooHDADevice::dumpExtMsg(const char *format, ...)
 		unlockExtMsgBuffer();
 	
 	va_end(args);
+}
+
+
+/* ---------------------------------------------------------------------------------------------
+ * Intel display codec support (HDMI/DP audio) for Skylake and later PCH HDA controllers.
+ *
+ * The display codec (8086:280x/281x) is reached through the controller's "iDisp" multi-link.
+ * Two things keep it invisible to a plain HDA driver:
+ *  1. it only responds to the link reset while the GPU asserts the codec-wake signal
+ *     (Linux: snd_hdac_set_codec_wakeup -> i915 codec_wake_override: AUD_PIN_BUF_CTL enable,
+ *     HSW_AUD_CHICKENBIT bit 15 pulse), and
+ *  2. the multi-link must be powered (LCTL.SPA, wait CPA) before verbs reach the codec
+ *     (Linux: intel_init_lctl / snd_hdac_ext_bus_link_power_up).
+ * The GPU side is reached by mapping the IGPU's BAR0 (same physical window the framebuffer
+ * driver maps; we only touch the two audio registers).
+ * ------------------------------------------------------------------------------------------ */
+#define kVoodooHDAIntelDisplayCodec	"IntelDisplayCodec"
+#define IGFX_AUD_PIN_BUF_CTL		0x48414
+#define IGFX_AUD_PIN_BUF_ENABLE		(1U << 31)
+#define IGFX_AUD_CHICKENBIT		0x65f10
+#define IGFX_AUD_CODEC_WAKE_SIGNAL	(1U << 15)
+#define HDAC_LLCH			0x14
+#define HDAC_CAP_ID(x)			(((x) >> 16) & 0xfff)
+#define HDAC_CAP_NEXT(x)		((x) & 0xffff)
+#define HDAC_ML_CAP_ID			2
+#define HDAC_ML_MLCD			0x04
+#define HDAC_ML_BASE			0x40
+#define HDAC_ML_INTERVAL		0x40
+#define HDAC_ML_LCAP			0x00
+#define HDAC_ML_LCTL			0x04
+#define HDAC_ML_LCTL_SPA		(1U << 16)
+#define HDAC_ML_LCTL_CPA		(1U << 23)
+
+bool VoodooHDADevice::intelDisplayCodecWanted()
+{
+	if ((mDeviceId & 0xffffU) != INTEL_VENDORID)
+		return false;
+	OSBoolean *b = OSDynamicCast(OSBoolean, getProperty(kVoodooHDAIntelDisplayCodec));
+	return b && b->isTrue();
+}
+
+IOPCIDevice *VoodooHDADevice::findIntelIGPU()
+{
+	IOPCIDevice *found = NULL;
+	OSDictionary *match = IOService::serviceMatching("IOPCIDevice");
+	if (!match)
+		return NULL;
+	OSIterator *it = IOService::getMatchingServices(match);
+	match->release();
+	if (!it)
+		return NULL;
+	OSObject *obj;
+	while ((obj = it->getNextObject())) {
+		IOPCIDevice *dev = OSDynamicCast(IOPCIDevice, obj);
+		if (!dev || dev->getBusNumber() != 0 || dev->getDeviceNumber() != 2 || dev->getFunctionNumber() != 0)
+			continue;
+		if (dev->configRead16(kIOPCIConfigVendorID) != INTEL_VENDORID)
+			continue;
+		if ((dev->configRead32(kIOPCIConfigRevisionID) >> 24) != 0x03)	/* display controller */
+			continue;
+		found = dev;
+		found->retain();
+		break;
+	}
+	it->release();
+	return found;
+}
+
+void VoodooHDADevice::intelDisplayCodecWake(bool enable)
+{
+	if (!mIgpuMap) {
+		IOPCIDevice *igpu = findIntelIGPU();
+		if (!igpu) {
+			errorMsg("IntelDisplayCodec: Intel IGPU (0:2:0) not found\n");
+			return;
+		}
+		mIgpuMap = igpu->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0);
+		igpu->release();
+		if (!mIgpuMap) {
+			errorMsg("IntelDisplayCodec: cannot map IGPU BAR0\n");
+			return;
+		}
+		mIgpuBase = mIgpuMap->getVirtualAddress();
+	}
+	if (!mIgpuBase)
+		return;
+	volatile UInt32 *pinbuf = (volatile UInt32 *)(mIgpuBase + IGFX_AUD_PIN_BUF_CTL);
+	volatile UInt32 *chicken = (volatile UInt32 *)(mIgpuBase + IGFX_AUD_CHICKENBIT);
+	if (enable)
+		*pinbuf = *pinbuf | IGFX_AUD_PIN_BUF_ENABLE;
+	*chicken = *chicken & ~IGFX_AUD_CODEC_WAKE_SIGNAL;
+	IODelay(1500);
+	if (enable) {
+		*chicken = *chicken | IGFX_AUD_CODEC_WAKE_SIGNAL;
+		IODelay(1500);
+	}
+	logMsg("IntelDisplayCodec: codec wake %s (AUD_CHICKENBIT=0x%08x AUD_PIN_BUF_CTL=0x%08x)\n",
+		   enable ? "on" : "off", *chicken, *pinbuf);
+}
+
+void VoodooHDADevice::intelDisplayLinksPowerUp()
+{
+	UInt32 off = readData16(HDAC_LLCH);
+	UInt32 mlcap = 0;
+	for (int guard = 0; off && guard < 10; guard++) {
+		UInt32 cap = readData32(off);
+		if (cap == 0xffffffffU)
+			break;
+		logMsg("IntelDisplayCodec: HDA capability id %u at 0x%x\n", (unsigned) HDAC_CAP_ID(cap), (unsigned) off);
+		if (HDAC_CAP_ID(cap) == HDAC_ML_CAP_ID)
+			mlcap = off;
+		off = HDAC_CAP_NEXT(cap);
+	}
+	if (!mlcap) {
+		logMsg("IntelDisplayCodec: no multi-link capability\n");
+		return;
+	}
+	UInt32 count = readData32(mlcap + HDAC_ML_MLCD) + 1;
+	if (count > 8)
+		count = 8;
+	for (UInt32 i = 0; i < count; i++) {
+		UInt32 base = mlcap + HDAC_ML_BASE + HDAC_ML_INTERVAL * i;
+		UInt32 lcap = readData32(base + HDAC_ML_LCAP);
+		UInt32 before = readData32(base + HDAC_ML_LCTL);
+		if (!(before & HDAC_ML_LCTL_SPA))
+			writeData32(base + HDAC_ML_LCTL, before | HDAC_ML_LCTL_SPA);
+		int timeout = 150;
+		while (timeout-- > 0 && !(readData32(base + HDAC_ML_LCTL) & HDAC_ML_LCTL_CPA))
+			IODelay(3);
+		UInt32 after = readData32(base + HDAC_ML_LCTL);
+		logMsg("IntelDisplayCodec: link %u LCAP=0x%08x LCTL 0x%08x -> 0x%08x%s\n", (unsigned) i, lcap, before, after,
+			   (after & HDAC_ML_LCTL_CPA) ? "" : " (CPA timeout)");
+	}
 }
