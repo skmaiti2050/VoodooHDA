@@ -1,0 +1,57 @@
+# Build the CLASSIC (/Library/Extensions) VoodooHDA from main — tranc/VoodooHDA_LE.xcodeproj.
+# Upstream CI only builds the _BL variant (embedded IOAudioFamily), which breaks Apple's
+# IOAudioFamily/USB audio when loaded. Put this file at .github/workflows/voodoohda-le.yml in a
+# fork of CloverHackyColor/VoodooHDA and run it from the Actions tab (workflow_dispatch).
+name: Build VoodooHDA LE
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    name: VoodooHDA_LE ${{ matrix.configuration }}
+    runs-on: macos-15-intel
+    timeout-minutes: 45
+    strategy:
+      matrix:
+        configuration: [Release, Debug]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install MacKernelSDK
+        uses: actions/checkout@v4
+        with:
+          repository: acidanthera/MacKernelSDK
+          ref: 3f750085caa17ec3a7880f11c11bf4f48cd6a164
+          path: MacKernelSDK
+      - name: Build
+        env:
+          CONFIGURATION: ${{ matrix.configuration }}
+        run: |
+          set -euo pipefail
+          mkdir -p logs
+          xcodebuild -project tranc/VoodooHDA_LE.xcodeproj -target VoodooHDA \
+            -configuration "$CONFIGURATION" -jobs 3 ARCHS=x86_64 \
+            SYMROOT="$PWD/build/products" OBJROOT="$PWD/build/obj" \
+            CODE_SIGNING_ALLOWED=NO GIT_COMMIT="_$(git rev-parse --short HEAD)" \
+            build > logs/VoodooHDA_LE.log 2>&1 || { tail -100 logs/VoodooHDA_LE.log; exit 1; }
+      - name: Package
+        env:
+          CONFIGURATION: ${{ matrix.configuration }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          kext_path=$(find "$PWD/build/products" -maxdepth 3 -name '*.kext' -type d -print -quit)
+          [[ -n "$kext_path" ]] || { echo "::error::no kext built"; find "$PWD/build/products" -maxdepth 4; exit 1; }
+          version=$(awk '/CURRENT_PROJECT_VERSION =/ {gsub(/;/, "", $3); print $3; exit}' tranc/VoodooHDA_LE.xcodeproj/project.pbxproj)
+          ditto -c -k --keepParent "$kext_path" "artifacts/VoodooHDA_LE-v${version:-main}-$(echo $CONFIGURATION | tr a-z A-Z)-$(git rev-parse --short HEAD).zip"
+          (cd artifacts && shasum -a 256 *.zip > SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VoodooHDA_LE-${{ matrix.configuration }}
+          path: artifacts/*
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: logs-${{ matrix.configuration }}
+          path: logs/
