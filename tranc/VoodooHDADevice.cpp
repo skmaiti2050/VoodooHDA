@@ -4500,6 +4500,11 @@ void VoodooHDADevice::intelDisplayCodecWake(bool enable)
 	}
 	IOLog("VoodooHDA IntelDisplayCodec: codec wake %s (AUD_CHICKENBIT=0x%08x AUD_PIN_BUF_CTL=0x%08x)\n",
 		   enable ? "on" : "off", *chicken, *pinbuf);
+	/* GPU-side audio state for diagnostics: ELD/CP valid bits per pipe, AUD_CONFIG A/B/C, AUD_FREQ_CNTRL */
+	IOLog("VoodooHDA IntelDisplayCodec: AUD_PIN_ELD_CP_VLD=0x%08x AUD_CONFIG A/B/C=0x%08x/0x%08x/0x%08x AUD_FREQ_CNTRL=0x%08x\n",
+		   *(volatile UInt32 *)(mIgpuBase + 0x650c0), *(volatile UInt32 *)(mIgpuBase + 0x65000),
+		   *(volatile UInt32 *)(mIgpuBase + 0x65100), *(volatile UInt32 *)(mIgpuBase + 0x65200),
+		   *(volatile UInt32 *)(mIgpuBase + 0x65900));
 }
 
 void VoodooHDADevice::intelDisplayLinksPowerUp()
