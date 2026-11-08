@@ -743,6 +743,20 @@ bool VoodooHDADevice::initHardware(IOService *provider)
 	mIntelDisplayCodec = intelDisplayCodecWanted();
 	IOLog("VoodooHDA IntelDisplayCodec: %s\n", mIntelDisplayCodec ? "enabled" : "disabled");
 	if (mIntelDisplayCodec) {
+		/* Wait for the display engine to finish coming up before touching its power wells.
+		 * At this point WindowServer has started but has not done its first mode set yet
+		 * (2026-11-08 20:12: init at 20:11:57, CGXDisplaysWillReconfigure at 20:12:07). Asking
+		 * for the display power wells during that bring-up stalls the pipe:
+		 * "IOAccelDisplayPipeTransaction time out after 300ms" at 20:12:08 followed by
+		 * "timed out fence" and both panels black, even though no audio register was programmed
+		 * (the codec had vanished, so presence/AUD_CONFIG never ran). Delay is tunable with
+		 * "-vhdadisp-defer=<ms>" (default 15000). */
+		int deferMs = 15000;
+		PE_parse_boot_argn("-vhdadisp-defer", &deferMs, sizeof deferMs);
+		intelDisplayMapIgpu();
+		intelLogTranscoders("before defer");
+		IOSleep(deferMs);
+		intelLogTranscoders("after defer");
 		/* The display codec lives in the GPU's display engine: its registers and the codec itself are
 		 * unpowered until power wells 2/3 are on (Linux: i915 POWER_DOMAIN_AUDIO_*). Request them
 		 * ourselves like i915 does, then wake + reset; retry a few times if the codec does not show up. */
@@ -4523,23 +4537,44 @@ IOPCIDevice *VoodooHDADevice::findIntelIGPU()
 	return found;
 }
 
-void VoodooHDADevice::intelDisplayCodecWake(bool enable)
+bool VoodooHDADevice::intelDisplayMapIgpu()
 {
+	if (mIgpuBase)
+		return true;
 	if (!mIgpuMap) {
 		IOPCIDevice *igpu = findIntelIGPU();
 		if (!igpu) {
 			IOLog("VoodooHDA IntelDisplayCodec: Intel IGPU (0:2:0) not found\n");
-			return;
+			return false;
 		}
 		mIgpuMap = igpu->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0);
 		igpu->release();
 		if (!mIgpuMap) {
 			IOLog("VoodooHDA IntelDisplayCodec: cannot map IGPU BAR0\n");
-			return;
+			return false;
 		}
 		mIgpuBase = mIgpuMap->getVirtualAddress();
 	}
-	if (!mIgpuBase)
+	return mIgpuBase != 0;
+}
+
+void VoodooHDADevice::intelLogTranscoders(const char *when)
+{
+	if (!mIgpuBase) {
+		IOLog("VoodooHDA IntelDisplayCodec: %s: no IGPU map\n", when);
+		return;
+	}
+	for (UInt32 t = 0; t < 4; t++) {
+		UInt32 conf = *(volatile UInt32 *)(mIgpuBase + 0x70008 + 0x1000 * t);
+		UInt32 func = *(volatile UInt32 *)(mIgpuBase + 0x60400 + 0x1000 * t);
+		IOLog("VoodooHDA IntelDisplayCodec: %s: trans %c CONF=0x%08x DDI_FUNC_CTL=0x%08x (ddi=%u mode=%u)\n",
+			   when, 'A' + t, conf, func, (unsigned)((func >> 27) & 0xf), (unsigned)((func >> 24) & 7));
+	}
+}
+
+void VoodooHDADevice::intelDisplayCodecWake(bool enable)
+{
+	if (!intelDisplayMapIgpu())
 		return;
 	volatile UInt32 *pinbuf = (volatile UInt32 *)(mIgpuBase + IGFX_AUD_PIN_BUF_CTL);
 	volatile UInt32 *chicken = (volatile UInt32 *)(mIgpuBase + IGFX_AUD_CHICKENBIT);
@@ -4601,8 +4636,7 @@ void VoodooHDADevice::intelDisplayLinksPowerUp()
 bool VoodooHDADevice::intelDisplayPowerWellsOn()
 {
 	if (!mIgpuBase) {
-		intelDisplayCodecWake(false);	/* maps BAR0 as a side effect (no register writes when disabling and bit already clear) */
-		if (!mIgpuBase)
+		if (!intelDisplayMapIgpu())
 			return false;
 	}
 	volatile UInt32 *ctl2 = (volatile UInt32 *)(mIgpuBase + 0x45404);
