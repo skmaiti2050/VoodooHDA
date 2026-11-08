@@ -193,6 +193,7 @@ public:
 	void intelDisplayCodecWake(bool enable);
 	void intelDisplayLinksPowerUp();
 	bool intelDisplayPowerWellsOn();
+	void intelDisplayAudioPresence();
 	void intelDisplayAudioEnable();
 	IOMemoryMap *mIgpuMap;
 	IOVirtualAddress mIgpuBase;
